@@ -88,11 +88,4 @@
 
   = VIII. Conclusion and Future Work
   PRISM introduces a viable path toward ML-augmented OS scheduling by balancing predictive accuracy with low computational overhead. Future work will entail adding the full LSTM layer for complex temporal tracking. Additionally, we plan to test PRISM on real kernel traces and extend its capabilities to multicore scheduling architectures.
-
-  = References
-  [1] A. Silberschatz, P. B. Galvin, and G. Gagne, *Operating System Concepts*. Wiley, 2018. \
-  [2] J. Smith et al., "Markov Chains for Process Prediction in Real-time Systems," *IEEE Transactions on Computers*, 2021. \
-  [3] L. Chen and H. Wang, "Machine Learning Approaches to CPU Burst Time Prediction," *IEEE Access*, 2020. \
-  [4] K. Patel, "Deep Learning via LSTM for OS Scheduling," *Proceedings of the IEEE Conference on High Performance Computing*, 2022. \
-  [5] R. Jain, D. Chiu, and W. Hawe, "A Quantitative Measure of Fairness and Discrimination for Resource Allocation in Shared Computer Systems," *DEC Research Report*, 1984.
 ])
