@@ -1,0 +1,1 @@
+typst compile paper.typ paper.pdf
