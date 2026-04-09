@@ -1,4 +1,4 @@
-#set page(paper: "a4", margin: (top: 1in, bottom: 1in, left: 0.75in, right: 0.75in))
+content = r"""#set page(paper: "a4", margin: (top: 1in, bottom: 1in, left: 0.75in, right: 0.75in))
 #set text(font: "New Computer Modern", size: 10pt)
 #set par(justify: true)
 
@@ -127,3 +127,7 @@ This paper presented PRISM, a hybrid probabilistic and machine learning framewor
 [5] B. Fu et al., "ALPS: An Adaptive Learning Priority Scheduler," USENIX ATC, 2024.
 
 [6] I. Jain et al., "A Quantitative Measure of Fairness and Discrimination for Resource Allocation," DEC TR, 1984.
+"""
+
+with open('paper.typ', 'w', encoding='utf-8') as f:
+    f.write(content)
