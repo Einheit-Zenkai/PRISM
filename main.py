@@ -11,6 +11,18 @@ from sklearn.metrics import accuracy_score
 if not os.path.exists('results'):
     os.makedirs('results')
 
+P_IO_MAP = {
+    'cpu_bound': 0.2,
+    'io_bound': 0.6,
+    'mixed': 0.4
+}
+
+MARKOV_MULTIPLIER_MAP = {
+    'short': 0.8,
+    'medium': 1.0,
+    'long': 1.3
+}
+
 def generate_processes(num_processes=200):
     """
     Generates synthetic processes for the Day 1 simulation.
@@ -40,6 +52,13 @@ def get_burst_state(burst):
     elif burst <= 15: return 1 # medium
     else: return 2 # long
 
+def state_idx_to_label(state_idx):
+    if state_idx == 0:
+        return 'short'
+    if state_idx == 1:
+        return 'medium'
+    return 'long'
+
 def build_markov_chain(processes):
     # Build a 3x3 transition matrix from the generated processes
     transitions = np.zeros((3, 3))
@@ -57,16 +76,14 @@ def build_markov_chain(processes):
             transitions[i] = np.array([1/3, 1/3, 1/3])
     return transitions
 
-def predict_markov_burst(curr_burst, transitions):
-    # Predict the next state and convert to expected burst time
+def predict_markov_state(curr_burst, transitions):
+    # Predict next Markov burst category: short / medium / long
     curr_state = get_burst_state(curr_burst)
     probs = transitions[curr_state]
-    predicted_state = np.argmax(probs)
-    if predicted_state == 0: return 3.0
-    elif predicted_state == 1: return 8.0
-    else: return 20.0
+    predicted_state_idx = int(np.argmax(probs))
+    return state_idx_to_label(predicted_state_idx)
 
-def train_rf_classifier(processes):
+def train_rf_classifier(processes, verbose=True):
     # Features: burst_time, io_probability, priority
     # Label: process_type
     X = [[p['burst_time'], p['io_probability'], p['priority']] for p in processes]
@@ -79,8 +96,15 @@ def train_rf_classifier(processes):
     
     y_pred = clf.predict(X_test)
     acc = accuracy_score(y_test, y_pred)
-    print(f"Random Forest Classifier Accuracy: {acc*100:.2f}%")
+    if verbose:
+        print(f"Random Forest Classifier Accuracy: {acc*100:.2f}%")
     return clf
+
+def classifier_to_p_io(clf, process):
+    # Explicitly map RF class output to P_io coefficient
+    features = [[process['burst_time'], process['io_probability'], process['priority']]]
+    predicted_class = clf.predict(features)[0]
+    return P_IO_MAP.get(predicted_class, 0.4)
 
 def run_round_robin(processes_input, quantum=4):
     """
@@ -218,11 +242,17 @@ def run_prism_v2(processes_input, transitions):
     processes = [p.copy() for p in processes_input]
     for p in processes:
         p['remaining_time'] = p['burst_time']
-        # 1. Use Markov predicted burst time for queue ordering
-        pred_burst = predict_markov_burst(p['burst_time'], transitions)
+        # v2 keeps Markov-only burst category estimate for queue ordering
+        state_label = predict_markov_state(p['burst_time'], transitions)
+        if state_label == 'short':
+            pred_burst = 3.0
+        elif state_label == 'medium':
+            pred_burst = 8.0
+        else:
+            pred_burst = 20.0
         p['predicted_burst'] = pred_burst
-        # 2. Apply scheduling score logic: score = predicted_burst * (1 + io_probability) * (1/priority)
-        p['prism_score'] = pred_burst * (1 + p['io_probability']) * (1.0 / p['priority'])
+        # Fixed priority denominator to avoid divide-by-zero edge cases
+        p['prism_score'] = pred_burst * (1 + p['io_probability']) * (1.0 / (p['priority'] + 1))
         
     time = 0
     ready_queue = []
@@ -255,9 +285,9 @@ def run_prism_v2(processes_input, transitions):
     return completed, context_switches
 
 def predict_lstm_burst(actual_burst, previous_error):
-    # Simulate LSTM feature extraction using simple numpy weighted average
-    # Simulate the last 5 burst times of this process by adding noise
-    # Weights: [0.1, 0.15, 0.2, 0.25, 0.3] (recent = higher weight)
+    # LSTM-inspired weighted burst predictor.
+    # Uses recency-weighted history, approximating LSTM temporal behavior without
+    # backpropagation. Full LSTM via PyTorch planned for future work.
     history = [max(0.1, actual_burst + random.uniform(-0.5, 0.5) * actual_burst) for _ in range(5)]
     weights = np.array([0.1, 0.15, 0.2, 0.25, 0.3])
     predicted_burst = np.dot(history, weights)
@@ -267,21 +297,34 @@ def predict_lstm_burst(actual_burst, previous_error):
     adjusted_prediction = predicted_burst + (previous_error * learning_rate)
     return max(0.1, adjusted_prediction)
 
-def run_prism_v3(processes_input):
+def run_prism_v3(processes_input, transitions, clf):
     """
-    PRISM Scheduler (Version 3 - LSTM Predictor + Online Learning)
+    PRISM Scheduler (Version 3 - Markov + RF + LSTM-inspired Predictor)
     """
     processes = [p.copy() for p in processes_input]
     previous_error = 0.0
     
     for p in processes:
         p['remaining_time'] = p['burst_time']
-        pred_burst = predict_lstm_burst(p['burst_time'], previous_error)
-        p['predicted_burst'] = pred_burst
-        p['prism_score'] = pred_burst * (1 + p['io_probability']) * (1.0 / p['priority'])
+        # Layer 1: Markov predicted state -> multiplier
+        markov_state = predict_markov_state(p['burst_time'], transitions)
+        markov_multiplier = MARKOV_MULTIPLIER_MAP[markov_state]
+
+        # Layer 3: LSTM-inspired burst estimate
+        lstm_prediction = predict_lstm_burst(p['burst_time'], previous_error)
+
+        # Coupled Layer 1 + Layer 3
+        b_pred = lstm_prediction * markov_multiplier
+        p['predicted_burst'] = b_pred
+
+        # Layer 2: RF classifier -> explicit P_io mapping
+        p_io = classifier_to_p_io(clf, p)
+
+        # Final score: B_pred * (1 + P_io) * (1/(priority + 1))
+        p['prism_score'] = b_pred * (1 + p_io) * (1.0 / (p['priority'] + 1))
         
         # Update error for next prediction
-        error = p['burst_time'] - pred_burst
+        error = p['burst_time'] - b_pred
         previous_error = error
         
     time = 0
@@ -321,9 +364,54 @@ def jains_fairness_index(completed):
         return 0
     return (np.sum(turnarounds)**2) / (n * np.sum(turnarounds**2))
 
+def compute_metrics(completed, switches):
+    avg_ta = float(np.mean([p['turnaround_time'] for p in completed]))
+    avg_wt = float(np.mean([p['waiting_time'] for p in completed]))
+    total_burst = float(sum([p['burst_time'] for p in completed]))
+    max_finish = float(max([p['arrival_time'] + p['turnaround_time'] for p in completed]))
+    min_arrival = float(min([p['arrival_time'] for p in completed]))
+    cpu_util = (total_burst / (max_finish - min_arrival)) * 100 if max_finish > min_arrival else 0.0
+    fairness = float(jains_fairness_index(completed))
+    return {
+        'avg_turnaround': avg_ta,
+        'avg_waiting': avg_wt,
+        'context_switches': int(switches),
+        'cpu_utilization': cpu_util,
+        'fairness_index': fairness
+    }
+
+def print_summary_table(metrics, order):
+    print("\n=== Day 3 Scheduler Metrics Summary (n=1000) ===")
+    header = (
+        f"{'Scheduler':<12} | {'Avg Turnaround Time (ms)':<24} | {'Avg Waiting Time (ms)':<21} | "
+        f"{'Context Switches':<16} | {'CPU Utilization %':<17} | {'Jain Fairness Index':<19}"
+    )
+    print(header)
+    print("-" * len(header))
+    for name in order:
+        m = metrics[name]
+        print(
+            f"{name:<12} | {m['avg_turnaround']:<24.2f} | {m['avg_waiting']:<21.2f} | "
+            f"{m['context_switches']:<16} | {m['cpu_utilization']:<17.2f} | {m['fairness_index']:<19.4f}"
+        )
+
+def add_value_labels(ax):
+    for bar in ax.patches:
+        height = bar.get_height()
+        ax.annotate(
+            f"{height:.2f}",
+            (bar.get_x() + bar.get_width() / 2, height),
+            ha='center',
+            va='bottom',
+            fontsize=8,
+            rotation=90,
+            xytext=(0, 2),
+            textcoords='offset points'
+        )
+
 def main():
-    print("Generating 200 synthetic processes...")
-    processes = generate_processes(200)
+    print("Generating 1000 synthetic processes...")
+    processes = generate_processes(1000)
     
     print("Training ML Models...")
     transitions = build_markov_chain(processes)
@@ -334,7 +422,7 @@ def main():
     sjf_result, sjf_switches = run_sjf(processes)
     prism1_result, prism1_switches = run_prism_v1(processes)
     prism2_result, prism2_switches = run_prism_v2(processes, transitions)
-    prism3_result, prism3_switches = run_prism_v3(processes)
+    prism3_result, prism3_switches = run_prism_v3(processes, transitions, clf)
     
     metrics = {}
     results_list = [
@@ -347,58 +435,73 @@ def main():
     
     csv_data = []
     
-    print("\n=== Scheduler Metrics Summary ===")
-    print(f"{'Scheduler':<15} | {'Avg TA':<10} | {'Avg WT':<10} | {'Switches':<10} | {'CPU Util %':<10} | {'Fairness':<10}")
-    print("-" * 85)
+    scheduler_order = ['RR', 'SJF', 'PRISM_v1', 'PRISM_v2', 'PRISM_v3']
     
+    label_map = {
+        'Round Robin': 'RR',
+        'SJF': 'SJF',
+        'PRISM v1': 'PRISM_v1',
+        'PRISM v2': 'PRISM_v2',
+        'PRISM v3': 'PRISM_v3'
+    }
+
     for name, completed, switches in results_list:
-        avg_ta = np.mean([p['turnaround_time'] for p in completed])
-        avg_wt = np.mean([p['waiting_time'] for p in completed])
-        total_burst = sum([p['burst_time'] for p in completed])
-        max_finish = max([p['arrival_time'] + p['turnaround_time'] for p in completed])
-        min_arrival = min([p['arrival_time'] for p in completed])
-        cpu_util = (total_burst / (max_finish - min_arrival)) * 100
-        fairness = jains_fairness_index(completed)
-        
-        metrics[name] = {
-            'avg_turnaround': avg_ta,
-            'avg_waiting': avg_wt,
-            'context_switches': switches,
-            'cpu_utilization': cpu_util,
-            'fairness_index': fairness
-        }
-        
-        print(f"{name:<15} | {avg_ta:<10.2f} | {avg_wt:<10.2f} | {switches:<10} | {cpu_util:<10.2f}% | {fairness:<10.4f}")
-        csv_data.append([name, avg_ta, avg_wt, switches, cpu_util, fairness])
+        key = label_map[name]
+        metrics[key] = compute_metrics(completed, switches)
+        csv_data.append([
+            key,
+            metrics[key]['avg_turnaround'],
+            metrics[key]['avg_waiting'],
+            metrics[key]['context_switches'],
+            metrics[key]['cpu_utilization'],
+            metrics[key]['fairness_index']
+        ])
+
+    print_summary_table(metrics, scheduler_order)
         
     # Plotting
-    schedulers = list(metrics.keys())
+    schedulers = scheduler_order
     turnaround = [metrics[s]['avg_turnaround'] for s in schedulers]
     waiting = [metrics[s]['avg_waiting'] for s in schedulers]
     switches = [metrics[s]['context_switches'] for s in schedulers]
     utilization = [metrics[s]['cpu_utilization'] for s in schedulers]
-    
-    fig, axs = plt.subplots(1, 4, figsize=(20, 5))
-    colors = ['blue', 'orange', 'green', 'red', 'purple']
-    
+    fairness = [metrics[s]['fairness_index'] for s in schedulers]
+
+    fig, axs = plt.subplots(1, 5, figsize=(26, 5.5))
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+
     axs[0].bar(schedulers, turnaround, color=colors)
-    axs[0].set_title('Avg Turnaround Time')
+    axs[0].set_title('Average Turnaround Time')
     axs[0].set_ylabel('ms')
-    
+    axs[0].set_xlabel('Scheduler')
+    add_value_labels(axs[0])
+
     axs[1].bar(schedulers, waiting, color=colors)
-    axs[1].set_title('Avg Waiting Time')
+    axs[1].set_title('Average Waiting Time')
     axs[1].set_ylabel('ms')
-    
+    axs[1].set_xlabel('Scheduler')
+    add_value_labels(axs[1])
+
     axs[2].bar(schedulers, switches, color=colors)
-    axs[2].set_title('Total Context Sw.')
-    
+    axs[2].set_title('Total Context Switches')
+    axs[2].set_ylabel('count')
+    axs[2].set_xlabel('Scheduler')
+    add_value_labels(axs[2])
+
     axs[3].bar(schedulers, utilization, color=colors)
-    axs[3].set_title('CPU Utilization %')
+    axs[3].set_title('CPU Utilization')
     axs[3].set_ylabel('%')
-    
-    for ax in axs.flat:
-        ax.set_xticks(range(len(schedulers)))
-        ax.set_xticklabels(schedulers, rotation=15, ha='right')
+    axs[3].set_xlabel('Scheduler')
+    add_value_labels(axs[3])
+
+    axs[4].bar(schedulers, fairness, color=colors)
+    axs[4].set_title("Jain's Fairness Index")
+    axs[4].set_ylabel('index')
+    axs[4].set_xlabel('Scheduler')
+    add_value_labels(axs[4])
+
+    for ax in axs:
+        ax.tick_params(axis='x', rotation=20)
         
     plt.tight_layout()
     plt.savefig('results/day3_comparison.png')
@@ -407,7 +510,7 @@ def main():
     # Save CSV
     with open('results/day3_results.csv', 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Scheduler', 'Avg_Turnaround', 'Avg_Waiting', 'Context_Switches', 'CPU_Utilization', 'Fairness_Index'])
+        writer.writerow(['Scheduler', 'Avg_TAT', 'Avg_Wait', 'Context_Switches', 'CPU_Util', 'Fairness_Index'])
         writer.writerows(csv_data)
     print("Saved results to results/day3_results.csv")
 
@@ -425,12 +528,13 @@ def main():
         print(f"Testing scale n={n}...")
         ps = generate_processes(n)
         trans = build_markov_chain(ps)
+        rf_clf = train_rf_classifier(ps, verbose=False)
         
         rr_c, _ = run_round_robin(ps, quantum=4)
         sjf_c, _ = run_sjf(ps)
         p1_c, _ = run_prism_v1(ps)
         p2_c, _ = run_prism_v2(ps, trans)
-        p3_c, _ = run_prism_v3(ps)
+        p3_c, _ = run_prism_v3(ps, trans, rf_clf)
         
         scale_results['Round Robin'].append(np.mean([p['turnaround_time'] for p in rr_c]))
         scale_results['SJF'].append(np.mean([p['turnaround_time'] for p in sjf_c]))
